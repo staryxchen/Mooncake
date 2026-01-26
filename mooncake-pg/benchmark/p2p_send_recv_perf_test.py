@@ -51,12 +51,16 @@ def format_size(size_bytes):
 
 def worker(rank, world_size, sizes, iters, results):
     torch.cuda.set_device(rank)
+    # Set buffer capacity via env var, must be >= max test size
+    max_size = max(sizes)
+    buffer_cap = max(max_size, 16 * 1024 * 1024)
+    os.environ["MC_P2P_BUFFER_CAP"] = str(buffer_cap)
     dist.init_process_group(
         backend="mooncake",
         rank=rank,
         world_size=world_size,
         pg_options=pg.MooncakeBackendOptions(
-            torch.zeros((world_size,), dtype=torch.int32, device="cuda")
+            torch.zeros((world_size,), dtype=torch.int32, device="cuda"),
         ),
     )
 
@@ -113,8 +117,8 @@ def main():
         send_avg_ms, send_bw_gbps = results[f"{size}_rank0"]
         recv_avg_ms, recv_bw_gbps = results[f"{size}_rank1"]
         print(
-            "size={size} bytes={bytes} send_avg_ms={send_ms:.3f} send_bw_GBps={send_bw:.3f} "
-            "recv_avg_ms={recv_ms:.3f} recv_bw_GBps={recv_bw:.3f}".format(
+            "size={size} bytes={bytes} send_avg_lat={send_ms:.3f}ms send_bw={send_bw:.2f}GB/s "
+            "recv_avg_lat={recv_ms:.3f}ms recv_bw={recv_bw:.2f}GB/s".format(
                 size=format_size(size),
                 bytes=size,
                 send_ms=send_avg_ms,
