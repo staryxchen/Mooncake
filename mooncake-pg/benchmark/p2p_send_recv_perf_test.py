@@ -7,6 +7,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from mooncake import pg
 
+# Max chunk size for P2P (must match kBufferSize in mooncake_worker.cuh)
+MAX_CHUNK_SIZE = 16 * 1024 * 1024
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="P2P send/recv performance test")
@@ -49,12 +52,30 @@ def format_size(size_bytes):
     return f"{value:.2f}{units[unit_idx]}"
 
 
+def chunked_send(tensor, dst):
+    """Send tensor in chunks of MAX_CHUNK_SIZE."""
+    flat = tensor.view(-1)
+    total = flat.numel()
+    offset = 0
+    while offset < total:
+        end = min(offset + MAX_CHUNK_SIZE, total)
+        dist.send(flat[offset:end], dst=dst)
+        offset = end
+
+
+def chunked_recv(tensor, src):
+    """Recv tensor in chunks of MAX_CHUNK_SIZE."""
+    flat = tensor.view(-1)
+    total = flat.numel()
+    offset = 0
+    while offset < total:
+        end = min(offset + MAX_CHUNK_SIZE, total)
+        dist.recv(flat[offset:end], src=src)
+        offset = end
+
+
 def worker(rank, world_size, sizes, iters, results):
     torch.cuda.set_device(rank)
-    # Set buffer capacity via env var, must be >= max test size
-    max_size = max(sizes)
-    buffer_cap = max(max_size, 16 * 1024 * 1024)
-    os.environ["MC_P2P_BUFFER_CAP"] = str(buffer_cap)
     dist.init_process_group(
         backend="mooncake",
         rank=rank,
@@ -73,10 +94,10 @@ def worker(rank, world_size, sizes, iters, results):
         start = time.perf_counter()
         if rank == 0:
             for _ in range(iters):
-                dist.send(tensor, dst=1)
+                chunked_send(tensor, dst=1)
         else:
             for _ in range(iters):
-                dist.recv(tensor, src=0)
+                chunked_recv(tensor, src=0)
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
         avg_ms = (elapsed * 1000.0) / iters
