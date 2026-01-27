@@ -86,5 +86,11 @@ echo "Generated files:"
 ls -la mooncake/*.so
 
 echo ""
-echo "To install into mooncake-wheel package:"
-echo "  cp mooncake/*.so ../mooncake-wheel/mooncake/"
+echo "Installing into mooncake-wheel package..."
+cp mooncake/*.so "${ROOT_DIR}/mooncake-wheel/mooncake/"
+
+echo "Installing mooncake-wheel..."
+cd "${ROOT_DIR}/mooncake-wheel"
+pip3 install -e .
+
+echo "Installation completed!"
