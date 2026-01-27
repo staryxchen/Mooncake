@@ -109,6 +109,7 @@ class MooncakeBackend final : public ::c10d::Backend {
         int peerRank;
         int tag;
         int64_t seq;  // Sequence number assigned at enqueue time for ordering
+        size_t numBytes;
         std::shared_ptr<std::atomic<bool>> completed;
         std::shared_ptr<std::string> errorMsg;
     };

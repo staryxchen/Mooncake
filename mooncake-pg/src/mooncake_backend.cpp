@@ -312,6 +312,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
                                  .peerRank = dstRank,
                                  .tag = tag,
                                  .seq = seq,
+                                 .numBytes = numBytes,
                                  .completed = completed,
                                  .errorMsg = errorMsg});
     }
@@ -345,6 +346,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
                                  .peerRank = srcRank,
                                  .tag = tag,
                                  .seq = seq,
+                                 .numBytes = expectedBytes,
                                  .completed = completed,
                                  .errorMsg = errorMsg});
     }
@@ -894,8 +896,7 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
     int tag = op.tag;
     int64_t seq = op.seq;
 
-    const auto numBytes =
-        tensor.numel() * static_cast<size_t>(tensor.element_size());
+    const auto numBytes = op.numBytes;
 
     const int numSlotsNeeded =
         static_cast<int>((numBytes + kP2PSlotSize - 1) / kP2PSlotSize);
