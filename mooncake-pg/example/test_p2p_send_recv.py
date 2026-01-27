@@ -46,9 +46,13 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", "2"))
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    host_ip = os.environ.get("MC_HOST_IP", "127.0.0.1")
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29501")
+
+    # Set host IP for Transfer Engine before init_process_group
+    pg.set_host_ip(host_ip)
 
     worker(rank, world_size, local_rank)
 
