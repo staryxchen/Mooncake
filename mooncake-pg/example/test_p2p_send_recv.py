@@ -1,12 +1,11 @@
 import os
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from mooncake import pg
 
 
-def worker(rank, world_size, results):
-    torch.cuda.set_device(rank)
+def worker(rank, world_size, local_rank):
+    torch.cuda.set_device(local_rank)
     dist.init_process_group(
         backend="mooncake",
         rank=rank,
@@ -20,16 +19,22 @@ def worker(rank, world_size, results):
     warmup = torch.ones(1, dtype=torch.float32, device="cuda")
     dist.all_reduce(warmup)
 
+    rank = dist.get_rank()
+    backend = dist.get_backend()
+    print(f"Rank {rank} is ready and using backend {backend}")
+
     if rank == 0:
         # Rank 0: send tensor to Rank 1
         tensor = torch.tensor([42, 43, 44, 45], dtype=torch.float32, device="cuda")
         dist.send(tensor, dst=1)
-        results[rank] = tensor.tolist()
+        print(f"Rank 0 sent: {tensor.tolist()}")
     else:
         # Rank 1: receive tensor from Rank 0
         tensor = torch.zeros(4, dtype=torch.float32, device="cuda")
         dist.recv(tensor, src=0)
-        results[rank] = tensor.tolist()
+        received = tensor.tolist()
+        print(f"Rank 1 received: {received}")
+        assert received == [42.0, 43.0, 44.0, 45.0], "Sent and received data mismatch!"
 
     # Use all_reduce instead of barrier for sync (mooncake backend's barrier only supports CPU mode)
     sync_tensor = torch.ones(1, dtype=torch.float32, device="cuda")
@@ -38,23 +43,17 @@ def worker(rank, world_size, results):
 
 
 def main():
-    world_size = 2
-    assert (
-        torch.cuda.device_count() >= world_size
-    ), f"Requires at least {world_size} GPUs"
+    world_size = int(os.environ.get("WORLD_SIZE", "2"))
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "29501"
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29501")
 
-    mp_manager = mp.Manager()
-    results = mp_manager.dict()
+    worker(rank, world_size, local_rank)
 
-    mp.spawn(worker, args=(world_size, results), nprocs=world_size, join=True)
-
-    print(f"Rank 0 sent: {results[0]}")
-    print(f"Rank 1 received: {results[1]}")
-    assert results[0] == results[1], "Sent and received data mismatch!"
-    print("P2P send/recv test passed!")
+    if rank == 1:
+        print("P2P send/recv test passed!")
 
 
 if __name__ == "__main__":
