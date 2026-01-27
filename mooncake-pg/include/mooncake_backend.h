@@ -148,19 +148,15 @@ class MooncakeBackend final : public ::c10d::Backend {
         std::atomic<P2POpNode*> next{nullptr};
     };
 
-    // MPSC queue for send operations
-    // Stub node avoids special-casing empty queue
-    P2POpNode p2pSendStub_;
-    std::atomic<P2POpNode*> p2pSendHead_{
-        &p2pSendStub_};  // Consumer reads from here
-    std::atomic<P2POpNode*> p2pSendTail_{&p2pSendStub_};  // Producers push here
+    // MPSC queue for send operations (dynamically allocated stub)
+    std::atomic<P2POpNode*> p2pSendHead_{nullptr};
+    std::atomic<P2POpNode*> p2pSendTail_{nullptr};
     std::atomic<bool> p2pSendWorkerRunning_{false};
     std::thread p2pSendWorkerThread_;
 
     // MPSC queue for recv operations
-    P2POpNode p2pRecvStub_;
-    std::atomic<P2POpNode*> p2pRecvHead_{&p2pRecvStub_};
-    std::atomic<P2POpNode*> p2pRecvTail_{&p2pRecvStub_};
+    std::atomic<P2POpNode*> p2pRecvHead_{nullptr};
+    std::atomic<P2POpNode*> p2pRecvTail_{nullptr};
     std::atomic<bool> p2pRecvWorkerRunning_{false};
     std::thread p2pRecvWorkerThread_;
 

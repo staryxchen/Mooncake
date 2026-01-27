@@ -773,6 +773,17 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
 }
 
 void MooncakeBackend::startP2PWorker() {
+    // Initialize MPSC queues with dynamically allocated stub nodes
+    auto* sendStub = new P2POpNode();
+    sendStub->next.store(nullptr, std::memory_order_relaxed);
+    p2pSendHead_.store(sendStub, std::memory_order_relaxed);
+    p2pSendTail_.store(sendStub, std::memory_order_relaxed);
+
+    auto* recvStub = new P2POpNode();
+    recvStub->next.store(nullptr, std::memory_order_relaxed);
+    p2pRecvHead_.store(recvStub, std::memory_order_relaxed);
+    p2pRecvTail_.store(recvStub, std::memory_order_relaxed);
+
     p2pSendWorkerRunning_ = true;
     p2pRecvWorkerRunning_ = true;
     p2pSendWorkerThread_ =
@@ -794,6 +805,20 @@ void MooncakeBackend::stopP2PWorker() {
         if (p2pRecvWorkerThread_.joinable()) {
             p2pRecvWorkerThread_.join();
         }
+    }
+
+    // Clean up remaining nodes in queues
+    P2POpNode* node = p2pSendHead_.load(std::memory_order_relaxed);
+    while (node) {
+        P2POpNode* next = node->next.load(std::memory_order_relaxed);
+        delete node;
+        node = next;
+    }
+    node = p2pRecvHead_.load(std::memory_order_relaxed);
+    while (node) {
+        P2POpNode* next = node->next.load(std::memory_order_relaxed);
+        delete node;
+        node = next;
     }
 }
 
