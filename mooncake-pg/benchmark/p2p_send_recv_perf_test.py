@@ -25,6 +25,19 @@ def parse_args():
         default=1000,
         help="Iterations per size.",
     )
+    parser.add_argument(
+        "--world_size",
+        type=int,
+        default=None,
+        help="Total number of processes (must be 2 for P2P).",
+    )
+    parser.add_argument("--rank", type=int, default=None, help="Global rank.")
+    parser.add_argument("--local_rank", type=int, default=None, help="Local rank.")
+    parser.add_argument("--master_addr", type=str, default=None, help="Master address.")
+    parser.add_argument("--master_port", type=str, default=None, help="Master port.")
+    parser.add_argument(
+        "--host_ip", type=str, default=None, help="Host IP for transfer engine."
+    )
     return parser.parse_args()
 
 
@@ -74,8 +87,16 @@ def chunked_recv(tensor, src):
         offset = end
 
 
-def worker(rank, world_size, sizes, iters, results):
-    torch.cuda.set_device(rank)
+def worker(rank, world_size, sizes, iters, host_ip, local_rank=None):
+    if local_rank is None:
+        local_rank = rank
+    torch.cuda.set_device(local_rank)
+    if torch.cuda.device_count() <= local_rank:
+        raise RuntimeError(
+            f"Local rank {local_rank} exceeds visible CUDA devices {torch.cuda.device_count()}"
+        )
+
+    pg.set_host_ip(host_ip)
     dist.init_process_group(
         backend="mooncake",
         rank=rank,
@@ -104,7 +125,23 @@ def worker(rank, world_size, sizes, iters, results):
         bw_gbps = 0.0
         if avg_ms > 0:
             bw_gbps = (size / (avg_ms / 1000.0)) / 1e9
-        results[f"{size}_rank{rank}"] = (avg_ms, bw_gbps)
+
+        gathered = [None for _ in range(world_size)]
+        dist.all_gather_object(gathered, (size, avg_ms, bw_gbps))
+        if rank == 0:
+            send_size, send_avg_ms, send_bw_gbps = gathered[0]
+            _, recv_avg_ms, recv_bw_gbps = gathered[1]
+            print(
+                "size={size} bytes={bytes} send_avg_lat={send_ms:.3f}ms send_bw={send_bw:.2f}GB/s "
+                "recv_avg_lat={recv_ms:.3f}ms recv_bw={recv_bw:.2f}GB/s".format(
+                    size=format_size(send_size),
+                    bytes=send_size,
+                    send_ms=send_avg_ms,
+                    send_bw=send_bw_gbps,
+                    recv_ms=recv_avg_ms,
+                    recv_bw=recv_bw_gbps,
+                )
+            )
 
         sync_tensor = torch.ones(1, dtype=torch.float32, device="cuda")
         dist.all_reduce(sync_tensor)
@@ -112,42 +149,62 @@ def worker(rank, world_size, sizes, iters, results):
     dist.destroy_process_group()
 
 
+def resolve_runtime(args):
+    env_rank = os.environ.get("RANK")
+    env_world = os.environ.get("WORLD_SIZE")
+    env_local = os.environ.get("LOCAL_RANK")
+
+    if args.rank is None and env_rank is None:
+        return None
+
+    rank = int(args.rank if args.rank is not None else env_rank)
+    world_size = int(
+        args.world_size if args.world_size is not None else (env_world or 2)
+    )
+    local_rank = int(
+        args.local_rank if args.local_rank is not None else (env_local or 0)
+    )
+    return rank, local_rank, world_size
+
+
+def resolve_world_size(args):
+    env_world = os.environ.get("WORLD_SIZE")
+    if args.world_size is not None:
+        return int(args.world_size)
+    if env_world is not None:
+        return int(env_world)
+    return 2
+
+
 def main():
     args = parse_args()
-    world_size = 2
-    assert (
-        torch.cuda.device_count() >= world_size
-    ), f"Requires at least {world_size} GPUs"
+    world_size = resolve_world_size(args)
+    if world_size != 2:
+        raise ValueError("P2P send/recv perf test only supports world_size=2")
 
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29501")
+    master_addr = args.master_addr or os.environ.get("MASTER_ADDR", "127.0.0.1")
+    master_port = args.master_port or os.environ.get("MASTER_PORT", "29501")
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = master_port
 
+    host_ip = args.host_ip or os.environ.get("MC_HOST_IP", "127.0.0.1")
     sizes = generate_sizes(args.size_bytes)
 
-    mp_manager = mp.Manager()
-    results = mp_manager.dict()
-
-    mp.spawn(
-        worker,
-        args=(world_size, sizes, args.iters, results),
-        nprocs=world_size,
-        join=True,
-    )
-
-    for size in sizes:
-        send_avg_ms, send_bw_gbps = results[f"{size}_rank0"]
-        recv_avg_ms, recv_bw_gbps = results[f"{size}_rank1"]
-        print(
-            "size={size} bytes={bytes} send_avg_lat={send_ms:.3f}ms send_bw={send_bw:.2f}GB/s "
-            "recv_avg_lat={recv_ms:.3f}ms recv_bw={recv_bw:.2f}GB/s".format(
-                size=format_size(size),
-                bytes=size,
-                send_ms=send_avg_ms,
-                send_bw=send_bw_gbps,
-                recv_ms=recv_avg_ms,
-                recv_bw=recv_bw_gbps,
-            )
+    runtime = resolve_runtime(args)
+    if runtime is None:
+        assert (
+            torch.cuda.device_count() >= world_size
+        ), f"Requires at least {world_size} GPUs"
+        mp.spawn(
+            worker,
+            args=(world_size, sizes, args.iters, host_ip),
+            nprocs=world_size,
+            join=True,
         )
+        return
+
+    rank, local_rank, world_size = runtime
+    worker(rank, world_size, sizes, args.iters, host_ip, local_rank=local_rank)
 
 
 if __name__ == "__main__":
