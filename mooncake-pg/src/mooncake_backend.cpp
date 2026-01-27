@@ -303,20 +303,18 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
     auto completed = std::make_shared<std::atomic<bool>>(false);
     auto errorMsg = std::make_shared<std::string>();
 
-    {
-        std::lock_guard<std::mutex> lock(p2pSendQueueMutex_);
-        const int64_t seq = meta_.p2pSendSeq[dstRank]++;
-        p2pSendQueue_.push(P2POp{.opType = P2POpType::SEND,
-                                 .tensor = contiguous,
-                                 .originalTensor = at::Tensor(),
-                                 .peerRank = dstRank,
-                                 .tag = tag,
-                                 .seq = seq,
-                                 .numBytes = numBytes,
-                                 .completed = completed,
-                                 .errorMsg = errorMsg});
-    }
-    p2pSendQueueCv_.notify_one();
+    const int64_t seq = meta_.p2pSendSeq[dstRank]++;
+    P2POp op{.opType = P2POpType::SEND,
+             .tensor = contiguous,
+             .originalTensor = at::Tensor(),
+             .peerRank = dstRank,
+             .tag = tag,
+             .seq = seq,
+             .numBytes = numBytes,
+             .completed = completed,
+             .errorMsg = errorMsg};
+
+    p2pSendEnqueue(std::move(op));
 
     return c10::make_intrusive<MooncakeP2PWork>(completed, errorMsg);
 }
@@ -337,20 +335,18 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
     auto completed = std::make_shared<std::atomic<bool>>(false);
     auto errorMsg = std::make_shared<std::string>();
 
-    {
-        std::lock_guard<std::mutex> lock(p2pRecvQueueMutex_);
-        const int64_t seq = meta_.p2pRecvSeq[srcRank]++;
-        p2pRecvQueue_.push(P2POp{.opType = P2POpType::RECV,
-                                 .tensor = target,
-                                 .originalTensor = tensor,
-                                 .peerRank = srcRank,
-                                 .tag = tag,
-                                 .seq = seq,
-                                 .numBytes = expectedBytes,
-                                 .completed = completed,
-                                 .errorMsg = errorMsg});
-    }
-    p2pRecvQueueCv_.notify_one();
+    const int64_t seq = meta_.p2pRecvSeq[srcRank]++;
+    P2POp op{.opType = P2POpType::RECV,
+             .tensor = target,
+             .originalTensor = tensor,
+             .peerRank = srcRank,
+             .tag = tag,
+             .seq = seq,
+             .numBytes = expectedBytes,
+             .completed = completed,
+             .errorMsg = errorMsg};
+
+    p2pRecvEnqueue(std::move(op));
 
     return c10::make_intrusive<MooncakeP2PWork>(completed, errorMsg);
 }
@@ -788,7 +784,6 @@ void MooncakeBackend::startP2PWorker() {
 void MooncakeBackend::stopP2PWorker() {
     if (p2pSendWorkerRunning_.load()) {
         p2pSendWorkerRunning_ = false;
-        p2pSendQueueCv_.notify_all();
         if (p2pSendWorkerThread_.joinable()) {
             p2pSendWorkerThread_.join();
         }
@@ -796,34 +791,70 @@ void MooncakeBackend::stopP2PWorker() {
 
     if (p2pRecvWorkerRunning_.load()) {
         p2pRecvWorkerRunning_ = false;
-        p2pRecvQueueCv_.notify_all();
         if (p2pRecvWorkerThread_.joinable()) {
             p2pRecvWorkerThread_.join();
         }
     }
 }
 
+// MPSC lock-free queue: Vyukov's intrusive linked-list algorithm
+// Multiple producers can enqueue concurrently; single consumer dequeues
+void MooncakeBackend::p2pSendEnqueue(P2POp&& op) {
+    auto* node = new P2POpNode();
+    node->op = std::move(op);
+    node->next.store(nullptr, std::memory_order_relaxed);
+
+    // Atomically swap tail, get previous tail
+    P2POpNode* prev = p2pSendTail_.exchange(node, std::memory_order_acq_rel);
+    // Link previous node to new node (linearization point for consumer)
+    prev->next.store(node, std::memory_order_release);
+}
+
+MooncakeBackend::P2POpNode* MooncakeBackend::p2pSendDequeue() {
+    P2POpNode* head = p2pSendHead_.load(std::memory_order_relaxed);
+    P2POpNode* next = head->next.load(std::memory_order_acquire);
+    if (next == nullptr) {
+        return nullptr;  // Queue empty
+    }
+    // Move head forward, return the node containing data
+    p2pSendHead_.store(next, std::memory_order_relaxed);
+    delete head;  // Delete old stub
+    return next;
+}
+
+void MooncakeBackend::p2pRecvEnqueue(P2POp&& op) {
+    auto* node = new P2POpNode();
+    node->op = std::move(op);
+    node->next.store(nullptr, std::memory_order_relaxed);
+
+    P2POpNode* prev = p2pRecvTail_.exchange(node, std::memory_order_acq_rel);
+    prev->next.store(node, std::memory_order_release);
+}
+
+MooncakeBackend::P2POpNode* MooncakeBackend::p2pRecvDequeue() {
+    P2POpNode* head = p2pRecvHead_.load(std::memory_order_relaxed);
+    P2POpNode* next = head->next.load(std::memory_order_acquire);
+    if (next == nullptr) {
+        return nullptr;
+    }
+    p2pRecvHead_.store(next, std::memory_order_relaxed);
+    delete head;
+    return next;
+}
+
 void MooncakeBackend::p2PSendWorkerThread() {
-    while (p2pSendWorkerRunning_.load()) {
-        P2POp op;
-        {
-            std::unique_lock<std::mutex> lock(p2pSendQueueMutex_);
-            p2pSendQueueCv_.wait(lock, [this] {
-                return !p2pSendQueue_.empty() || !p2pSendWorkerRunning_.load();
-            });
-
-            if (!p2pSendWorkerRunning_.load() && p2pSendQueue_.empty()) {
-                break;
-            }
-
-            if (p2pSendQueue_.empty()) {
+    while (p2pSendWorkerRunning_.load(std::memory_order_relaxed)) {
+        P2POpNode* node = p2pSendDequeue();
+        if (!node) {
+            std::this_thread::yield();
+            node = p2pSendDequeue();
+            if (!node) {
+                std::this_thread::sleep_for(std::chrono::microseconds(1));
                 continue;
             }
-
-            op = p2pSendQueue_.front();
-            p2pSendQueue_.pop();
         }
 
+        P2POp& op = node->op;
         try {
             processSendOp(op);
             op.completed->store(true, std::memory_order_release);
@@ -835,46 +866,40 @@ void MooncakeBackend::p2PSendWorkerThread() {
 }
 
 void MooncakeBackend::p2PRecvWorkerThread() {
-    while (p2pRecvWorkerRunning_.load()) {
-        P2POp op;
-        bool foundReady = false;
-        {
-            std::unique_lock<std::mutex> lock(p2pRecvQueueMutex_);
-            p2pRecvQueueCv_.wait(lock, [this] {
-                return !p2pRecvQueue_.empty() || !p2pRecvWorkerRunning_.load();
-            });
+    // Pending ops that are out-of-order and waiting for their turn
+    std::vector<P2POpNode*> pendingNodes;
 
-            if (!p2pRecvWorkerRunning_.load() && p2pRecvQueue_.empty()) {
+    while (p2pRecvWorkerRunning_.load(std::memory_order_relaxed)) {
+        bool foundReady = false;
+        P2POpNode* readyNode = nullptr;
+
+        // First check pending nodes for ready ones
+        for (auto it = pendingNodes.begin(); it != pendingNodes.end(); ++it) {
+            P2POp& op = (*it)->op;
+            if (op.seq == meta_.p2pRecvNextExpected[op.peerRank]) {
+                readyNode = *it;
+                pendingNodes.erase(it);
+                foundReady = true;
                 break;
             }
+        }
 
-            if (p2pRecvQueue_.empty()) {
-                continue;
-            }
-
-            std::queue<P2POp> tempQueue;
-            while (!p2pRecvQueue_.empty()) {
-                P2POp candidate = p2pRecvQueue_.front();
-                p2pRecvQueue_.pop();
-
-                if (!foundReady &&
-                    candidate.seq ==
-                        meta_.p2pRecvNextExpected[candidate.peerRank]) {
-                    op = candidate;
+        // If no ready op in pending, try dequeue new ones
+        if (!foundReady) {
+            P2POpNode* node = p2pRecvDequeue();
+            if (node) {
+                P2POp& op = node->op;
+                if (op.seq == meta_.p2pRecvNextExpected[op.peerRank]) {
+                    readyNode = node;
                     foundReady = true;
                 } else {
-                    tempQueue.push(candidate);
+                    pendingNodes.push_back(node);
                 }
-            }
-
-            // Put remaining operations back
-            while (!tempQueue.empty()) {
-                p2pRecvQueue_.push(tempQueue.front());
-                tempQueue.pop();
             }
         }
 
         if (foundReady) {
+            P2POp& op = readyNode->op;
             try {
                 processRecvOp(op);
                 meta_.p2pRecvNextExpected[op.peerRank] = op.seq + 1;
@@ -884,9 +909,14 @@ void MooncakeBackend::p2PRecvWorkerThread() {
                 op.completed->store(true, std::memory_order_release);
             }
         } else {
-            // No ready operation, wait a bit and retry
-            std::this_thread::sleep_for(std::chrono::microseconds(10));
+            std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::microseconds(1));
         }
+    }
+
+    // Cleanup pending nodes on shutdown
+    for (auto* node : pendingNodes) {
+        delete node;
     }
 }
 

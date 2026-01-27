@@ -5,11 +5,10 @@
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <transfer_engine.h>
-#include <queue>
 #include <mutex>
-#include <condition_variable>
 #include <atomic>
 #include <thread>
+#include <vector>
 
 namespace mooncake {
 
@@ -141,18 +140,35 @@ class MooncakeBackend final : public ::c10d::Backend {
     void connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                           int backendIndex);
 
-    // P2P async infrastructure: separate queues and threads for send/recv
-    std::queue<P2POp> p2pSendQueue_;
-    std::mutex p2pSendQueueMutex_;
-    std::condition_variable p2pSendQueueCv_;
+    // Lock-free MPSC queue for P2P operations (multiple producer threads,
+    // single consumer) Uses intrusive linked-list approach: O(1)
+    // enqueue/dequeue, unbounded
+    struct P2POpNode {
+        P2POp op;
+        std::atomic<P2POpNode*> next{nullptr};
+    };
+
+    // MPSC queue for send operations
+    // Stub node avoids special-casing empty queue
+    P2POpNode p2pSendStub_;
+    std::atomic<P2POpNode*> p2pSendHead_{
+        &p2pSendStub_};  // Consumer reads from here
+    std::atomic<P2POpNode*> p2pSendTail_{&p2pSendStub_};  // Producers push here
     std::atomic<bool> p2pSendWorkerRunning_{false};
     std::thread p2pSendWorkerThread_;
 
-    std::queue<P2POp> p2pRecvQueue_;
-    std::mutex p2pRecvQueueMutex_;
-    std::condition_variable p2pRecvQueueCv_;
+    // MPSC queue for recv operations
+    P2POpNode p2pRecvStub_;
+    std::atomic<P2POpNode*> p2pRecvHead_{&p2pRecvStub_};
+    std::atomic<P2POpNode*> p2pRecvTail_{&p2pRecvStub_};
     std::atomic<bool> p2pRecvWorkerRunning_{false};
     std::thread p2pRecvWorkerThread_;
+
+    // MPSC queue operations
+    void p2pSendEnqueue(P2POp&& op);
+    P2POpNode* p2pSendDequeue();  // Returns nullptr if empty
+    void p2pRecvEnqueue(P2POp&& op);
+    P2POpNode* p2pRecvDequeue();
 };
 
 }  // namespace mooncake
