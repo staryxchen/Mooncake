@@ -133,18 +133,16 @@ def worker(rank, world_size, sizes, iters, host_ip, local_rank=None):
             _, recv_avg_ms, recv_bw_gbps = gathered[1]
             if size == sizes[0]:
                 print(
-                    "{:<10} {:<12} {:<15} {:<13} {:<15} {:<13}".format(
-                        "size",
+                    "{:<12} {:<17} {:<13} {:<17} {:<13}".format(
                         "bytes",
-                        "send_avg_lat",
-                        "send_bw",
-                        "recv_avg_lat",
-                        "recv_bw",
+                        "send_avg_lat(ms)",
+                        "send_bw(GB/s)",
+                        "recv_avg_lat(ms)",
+                        "recv_bw(GB/s)",
                     )
                 )
             print(
-                "{:<10} {:<12} {:<15.3f} {:<13.2f} {:<15.3f} {:<13.2f}".format(
-                    format_size(send_size),
+                "{:<12} {:<17.3f} {:<13.2f} {:<17.3f} {:<13.2f}".format(
                     send_size,
                     send_avg_ms,
                     send_bw_gbps,
