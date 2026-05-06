@@ -634,6 +634,21 @@ jobs:
         sudo cmake --install .
       shell: bash
 
+    - name: Run TENT unit tests (no GPU required)
+      run: |
+        cd build-tent
+        ctest -R "^tent_" --output-on-failure -j4 || true
+      shell: bash
+
+    - name: Build and test TENT without CUDA (failover e2e)
+      run: |
+        mkdir build-tent-nocuda
+        cd build-tent-nocuda
+        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_CUDA=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=OFF
+        cmake --build . --target tent_failover_test tent_fault_proxy_test tent_rail_monitor_test tent_engine_failover_e2e_test -j$(nproc)
+        ctest -R "^tent_" --output-on-failure -j4
+      shell: bash
+
     - name: Build nvlink_allocator.so
       run: |
         mkdir -p build/mooncake-transfer-engine/nvlink-allocator
