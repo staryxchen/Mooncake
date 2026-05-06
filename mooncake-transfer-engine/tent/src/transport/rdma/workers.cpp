@@ -33,9 +33,13 @@ namespace {
 // Look up (or create) the RailMonitor for `machine_id` on this worker's
 // map. Returning a stable reference is safe because the map stores values
 // via unique_ptr -- rehashes move the pointer slot, not the RailMonitor.
+// Takes a pointer to the machine_id string living on SegmentDesc (stable
+// for the segment's lifetime), avoiding string copies on the submit path.
 RailMonitor& getOrCreateRail(
-    std::unordered_map<std::string, std::unique_ptr<RailMonitor>>& rails,
-    const std::string& machine_id) {
+    std::unordered_map<const std::string*, std::unique_ptr<RailMonitor>,
+                       Workers::WorkerContext::MachineIdPtrHash,
+                       Workers::WorkerContext::MachineIdPtrEqual>& rails,
+    const std::string* machine_id) {
     auto it = rails.find(machine_id);
     if (it != rails.end()) return *it->second;
     auto [ins, _] = rails.emplace(machine_id, std::make_unique<RailMonitor>());
@@ -545,7 +549,7 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         return Status::DeviceNotFound(
             "No device could access the slice memory region" LOC_MARK);
 
-    auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
+    auto& rail = getOrCreateRail(worker.rails, &target.segment->machine_id);
     if (!rail.ready() || target.topo != rail.remote())
         rail.load(source.topo, target.topo, /*rail_topo_json=*/"",
                   transport_->conf_.get());
@@ -645,7 +649,7 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         } else {
             auto& worker = worker_context_[tl_wid];
             auto& rail =
-                getOrCreateRail(worker.rails, target.segment->machine_id);
+                getOrCreateRail(worker.rails, &target.segment->machine_id);
             reachable = rail.available(sdev, tdev);
         }
 
@@ -682,7 +686,7 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
     // update rail state without a segment lookup or string-keyed map
     // lookup on the hot path.
     slice->rail_monitor = &getOrCreateRail(worker_context_[tl_wid].rails,
-                                           target.segment->machine_id);
+                                           &target.segment->machine_id);
     return Status::OK();
 }
 }  // namespace tent

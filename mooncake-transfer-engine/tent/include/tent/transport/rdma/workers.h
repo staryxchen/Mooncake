@@ -190,7 +190,25 @@ class Workers {
         // Values are held via unique_ptr so that map rehashing does not
         // invalidate pointers into RailMonitor stored on in-flight slices
         // (see RdmaSlice::rail_monitor).
-        std::unordered_map<std::string, std::unique_ptr<RailMonitor>> rails;
+        //
+        // Key: stable pointer to SegmentDesc::machine_id (never dangling
+        // because SegmentManager caches segments for the engine's lifetime).
+        // Using a pointer key avoids copying/hashing the full UUID string on
+        // every submit-path lookup. Equality is by string value (not pointer
+        // identity) in case two segments share the same machine_id.
+        struct MachineIdPtrHash {
+            size_t operator()(const std::string *p) const {
+                return std::hash<std::string>{}(*p);
+            }
+        };
+        struct MachineIdPtrEqual {
+            bool operator()(const std::string *a, const std::string *b) const {
+                return *a == *b;
+            }
+        };
+        std::unordered_map<const std::string *, std::unique_ptr<RailMonitor>,
+                           MachineIdPtrHash, MachineIdPtrEqual>
+            rails;
         PerfMetricSummary perf;
         uint64_t padding[16];
     };
