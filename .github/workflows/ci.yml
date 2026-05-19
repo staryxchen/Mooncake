@@ -622,13 +622,11 @@ jobs:
       run: |
         mkdir build-tent
         cd build-tent
-        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DUSE_CUDA=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON
       shell: bash
 
     - name: Build project with TENT
       run: |
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cd build-tent
         cmake --build .
         sudo cmake --install .
@@ -636,11 +634,8 @@ jobs:
 
     - name: Test (TENT)
       run: |
-        sudo ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
         cd build-tent
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        ctest -j --output-on-failure -R "tent|metrics_config_loader|request_merge|transfer_engine_config_override" -E "e2e"
+        ctest -j --output-on-failure
       shell: bash
 
     - name: Build nvlink_allocator.so
