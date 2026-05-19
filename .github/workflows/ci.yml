@@ -635,7 +635,7 @@ jobs:
     - name: Test (TENT)
       run: |
         cd build-tent
-        ctest -j --output-on-failure -E "hot_standby_service_test|catalog_backed_snapshot_provider_test|storage_backend_e2e_test"
+        ctest --test-dir mooncake-transfer-engine/tent/tests -j --output-on-failure
       shell: bash
 
     - name: Build nvlink_allocator.so
