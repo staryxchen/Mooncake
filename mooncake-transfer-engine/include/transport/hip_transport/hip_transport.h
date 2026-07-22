@@ -87,6 +87,7 @@ class HipTransport : public Transport {
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
         remap_entries_;
     RWSpinlock remap_lock_;
+    bool fabric_requested_;
     bool use_fabric_mem_;
 
     std::mutex register_mutex_;

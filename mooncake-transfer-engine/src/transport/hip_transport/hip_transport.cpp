@@ -102,7 +102,46 @@ static hipError_t importFromShareableHandle(
     }
 }
 
+static int pidfdGetfdError() {
+    static const int error = []() {
+#if defined(__NR_pidfd_open) && defined(__NR_pidfd_getfd)
+        int pipe_fds[2];
+        if (pipe(pipe_fds) == -1) {
+            return errno;
+        }
+        FdGuard read_guard(pipe_fds[0]);
+        FdGuard write_guard(pipe_fds[1]);
+
+        const int pid_fd =
+            static_cast<int>(syscall(__NR_pidfd_open, getpid(), 0));
+        if (pid_fd == -1) {
+            return errno;
+        }
+        FdGuard pid_guard(pid_fd);
+
+        const int duplicated_fd =
+            static_cast<int>(syscall(__NR_pidfd_getfd, pid_fd, pipe_fds[0], 0));
+        if (duplicated_fd == -1) {
+            return errno;
+        }
+        close(duplicated_fd);
+        return 0;
+#else
+        return ENOSYS;
+#endif
+    }();
+    return error;
+}
+
+static bool supportsPidfdGetfd() { return pidfdGetfdError() == 0; }
+
 static int open_fd(const hipxFabricHandle& export_handle) {
+#if !defined(__NR_pidfd_open) || !defined(__NR_pidfd_getfd)
+    (void)export_handle;
+    errno = ENOSYS;
+    LOG(ERROR) << "HIPTransport: pidfd_getfd is unavailable";
+    return -1;
+#else
     int fd = export_handle.fd;
     int pid = export_handle.pid;
 
@@ -123,6 +162,7 @@ static int open_fd(const hipxFabricHandle& export_handle) {
 
     close(pid_fd);
     return open_fd;
+#endif
 }
 
 static int openIPCHandle(const std::vector<unsigned char>& buffer,
@@ -344,16 +384,34 @@ static int getNumEvents() {
     return kDefaultNumEvents;
 }
 
-static bool supportFabricMem() {
+static bool fabricMemoryRequested() {
     // By default, use IPC mode. Fabric memory is enabled only when
     // MC_USE_HIP_IPC=0 or MC_USE_NVLINK_IPC=0 is explicitly set.
     const char* hip_ipc = getenv("MC_USE_HIP_IPC");
     const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
+    return (hip_ipc && strcmp(hip_ipc, "0") == 0) ||
+           (nvlink_ipc && strcmp(nvlink_ipc, "0") == 0);
+}
 
-    bool fabric_enabled = (hip_ipc && strcmp(hip_ipc, "0") == 0) ||
-                          (nvlink_ipc && strcmp(nvlink_ipc, "0") == 0);
+static void logPidfdGetfdFallback() {
+    static const bool logged = []() {
+        LOG(WARNING) << "HipTransport: Fabric memory was requested, but "
+                        "pidfd_getfd is unavailable ("
+                     << strerror(pidfdGetfdError())
+                     << "); falling back to HIP IPC. This can be caused by "
+                        "a Linux kernel older than 5.6 or a security policy.";
+        return true;
+    }();
+    (void)logged;
+}
 
-    if (!fabric_enabled) {
+static bool supportFabricMem(bool fabric_requested) {
+    if (!fabric_requested) {
+        return false;
+    }
+
+    if (!supportsPidfdGetfd()) {
+        logPidfdGetfdFallback();
         return false;
     }
 
@@ -393,7 +451,8 @@ static bool supportFabricMem() {
 }
 
 HipTransport::HipTransport()
-    : use_fabric_mem_(supportFabricMem()),
+    : fabric_requested_(fabricMemoryRequested()),
+      use_fabric_mem_(supportFabricMem(fabric_requested_)),
       stream_pool_(getNumStreams()),
       event_pool_(getNumEvents()) {
     // Enable P2P access for IPC mode
@@ -687,6 +746,11 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         hipIpcMemHandle_t handle;
         if (!checkHip(hipIpcGetMemHandle(&handle, addr),
                       "HipTransport: hipIpcGetMemHandle failed")) {
+            if (fabric_requested_) {
+                LOG(ERROR) << "HipTransport: Fabric memory was requested but "
+                              "unavailable, and HIP IPC export also failed; "
+                              "no unusable memory metadata was published";
+            }
             return -1;
         }
 
@@ -840,7 +904,7 @@ int HipTransport::unregisterLocalMemoryBatch(
 }
 
 void* HipTransport::allocatePinnedLocalMemory(size_t size) {
-    if (!supportFabricMem()) {
+    if (!supportFabricMem(fabricMemoryRequested())) {
         void* ptr = nullptr;
         if (!checkHip(hipMalloc(&ptr, size),
                       "HipTransport: hipMalloc failed")) {
@@ -930,7 +994,7 @@ void* HipTransport::allocatePinnedLocalMemory(size_t size) {
 }
 
 void HipTransport::freePinnedLocalMemory(void* ptr) {
-    if (!supportFabricMem()) {
+    if (!supportFabricMem(fabricMemoryRequested())) {
         (void)hipFree(ptr);
         return;
     }

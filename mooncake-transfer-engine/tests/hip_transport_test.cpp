@@ -16,8 +16,12 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <string>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "cuda_alike.h"
 #include "transfer_engine.h"
@@ -34,6 +38,55 @@ using namespace mooncake;
 
 namespace {
 constexpr size_t kLen = 64 * 1024;
+
+bool supportsPidfdGetfd() {
+#if defined(__NR_pidfd_open) && defined(__NR_pidfd_getfd)
+    int pipe_fds[2];
+    if (pipe(pipe_fds) == -1) return false;
+
+    const int pid_fd = static_cast<int>(syscall(__NR_pidfd_open, getpid(), 0));
+    if (pid_fd == -1) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        return false;
+    }
+
+    const int duplicated_fd =
+        static_cast<int>(syscall(__NR_pidfd_getfd, pid_fd, pipe_fds[0], 0));
+    close(pid_fd);
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    if (duplicated_fd == -1) return false;
+
+    close(duplicated_fd);
+    return true;
+#else
+    return false;
+#endif
+}
+
+class ScopedEnvironment {
+   public:
+    ScopedEnvironment(const char* name, const char* value) : name_(name) {
+        const char* previous = getenv(name);
+        had_previous_value_ = previous != nullptr;
+        if (had_previous_value_) previous_value_ = previous;
+        EXPECT_EQ(setenv(name, value, 1), 0);
+    }
+
+    ~ScopedEnvironment() {
+        if (had_previous_value_) {
+            (void)setenv(name_.c_str(), previous_value_.c_str(), 1);
+        } else {
+            (void)unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    std::string name_;
+    std::string previous_value_;
+    bool had_previous_value_ = false;
+};
 
 void* allocOnDevice(size_t size, int device) {
     EXPECT_EQ(cudaSetDevice(device), cudaSuccess);
@@ -124,6 +177,47 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
     (void)cudaSetDevice(kSourceDevice);
     (void)cudaFree(src);
     (void)cudaFree(dst);
+}
+
+TEST(HipTransportTest, FabricRequestFallsBackToIpcWithoutPidfdGetfd) {
+    if (supportsPidfdGetfd()) {
+        GTEST_SKIP() << "pidfd_getfd is available on this host.";
+    }
+
+    ScopedEnvironment force_fabric("MC_USE_HIP_IPC", "0");
+    auto engine = std::make_unique<TransferEngine>(false);
+    const std::string server_name = "127.0.0.1:17814";
+    if (engine->init(P2PHANDSHAKE, server_name, "127.0.0.1", 17814) != 0) {
+        GTEST_SKIP() << "TransferEngine init failed in this environment.";
+    }
+
+    if (engine->installTransport("hip", nullptr) == nullptr) {
+        GTEST_SKIP()
+            << "HIP transport unavailable (built without -DUSE_HIP=ON?).";
+    }
+
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count == 0) {
+        GTEST_SKIP() << "Needs at least one HIP device.";
+    }
+
+    void* buffer = allocOnDevice(kLen, 0);
+    ASSERT_EQ(engine->registerLocalMemory(buffer, kLen, "cuda:0"), 0);
+
+    const auto segment =
+        engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(segment, nullptr);
+    const auto buffer_it =
+        std::find_if(segment->buffers.begin(), segment->buffers.end(),
+                     [buffer](const TransferMetadata::BufferDesc& desc) {
+                         return desc.addr == reinterpret_cast<uint64_t>(buffer);
+                     });
+    ASSERT_NE(buffer_it, segment->buffers.end());
+    EXPECT_EQ(buffer_it->shm_name.size(), 2 * sizeof(hipIpcMemHandle_t));
+
+    ASSERT_EQ(engine->unregisterLocalMemory(buffer), 0);
+    (void)cudaFree(buffer);
 }
 
 int main(int argc, char** argv) {
