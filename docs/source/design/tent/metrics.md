@@ -4,12 +4,13 @@ TENT provides a built-in metrics system based on yalantinglibs, compatible with 
 
 ## Overview
 
-The metrics system supports two metric types:
+The metrics system supports three metric types:
 
 - **Counter**: Monotonically increasing values (e.g., total bytes transferred, total requests)
 - **Histogram**: Distribution of values with configurable buckets (e.g., latency)
+- **Gauge**: Current state values maintained through paired add/sub operations (e.g., in-flight attempts)
 
-All metrics are thread-safe and designed for high-performance data paths.
+All metrics are thread-safe and designed for high-performance data paths. Hot-path metrics record through pre-resolved label cells (`cached_metric.h`): each label's atomic cell is resolved once and cached, so the steady-state update is a relaxed atomic add with no locks. Measured with tebench 4K/1, the throughput gap between metrics enabled and disabled stays under 5% across thread counts.
 
 ## Performance Optimization
 
@@ -40,7 +41,7 @@ TentMetrics::setEnabled(true);
 bool enabled = TentMetrics::isEnabled();
 ```
 
-When disabled at runtime, record functions return immediately after a single atomic load (~1ns overhead).
+When disabled at runtime, counter and histogram record functions return immediately after a single atomic load (~1ns overhead). State gauges (`tent_inflight_attempts`, `tent_registered_buffer_bytes`) are the exception: they keep updating while disabled, because their paired add/sub operations must stay symmetric — skipping one half of a pair across a `setEnabled()` transition would permanently corrupt the gauge. The runtime switch therefore means "stop sampling": counters and histograms freeze, state tracking stays live.
 
 ## Configuration
 
@@ -192,6 +193,18 @@ tent_read_failures_total{transport="tcp"} 2
 # TYPE tent_transport_failover_total counter
 tent_transport_failover_total{from="rdma",to="tcp"} 1
 
+# HELP tent_task_failures_total Task-level failures by terminal transport and failure reason
+# TYPE tent_task_failures_total counter
+tent_task_failures_total{transport="rdma",reason="submit"} 2
+
+# HELP tent_inflight_attempts In-flight transport attempts (submitted, not yet finished)
+# TYPE tent_inflight_attempts gauge
+tent_inflight_attempts{transport="rdma"} 3
+
+# HELP tent_registered_buffer_bytes Registered local buffer bytes
+# TYPE tent_registered_buffer_bytes gauge
+tent_registered_buffer_bytes{transport="rdma"} 1073741824
+
 # HELP tent_read_latency_us Read latency distribution in microseconds
 # TYPE tent_read_latency_us histogram
 tent_read_latency_us_bucket{transport="rdma",le="100"} 10
@@ -199,7 +212,7 @@ tent_read_latency_us_bucket{transport="rdma",le="500"} 50
 ...
 ```
 
-**JSON Format (`/metrics/json`)**:
+**JSON Format (`/metrics/json`)**: counters are aggregated across labels into flat numbers; histograms are objects with `count`/`sum`/`buckets`; gauges are aggregated across labels into flat numbers (per-transport breakdown is via the Prometheus endpoint).
 ```json
 {
   "tent_read_bytes_total": 1048576,
@@ -207,13 +220,22 @@ tent_read_latency_us_bucket{transport="rdma",le="500"} 50
   "tent_read_requests_total": 100,
   "tent_write_requests_total": 50,
   "tent_read_failures_total": 2,
-  "tent_write_failures_total": 1
+  "tent_write_failures_total": 1,
+  "tent_transport_failover_total": 1,
+  "tent_task_failures_total": 2,
+  "tent_inflight_attempts": 3,
+  "tent_registered_buffer_bytes": 1073741824,
+  "tent_read_latency_us": {
+    "count": 100,
+    "sum": 2500,
+    "buckets": {"100": 10, "500": 50, "...": "..."}
+  }
 }
 ```
 
 **Summary Format (`/metrics/summary`)**:
 ```
-Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
+Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails) | Failovers: 1 | Quarantined batches: 0
 ```
 
 ## Available Metrics
@@ -229,6 +251,7 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_transport_failover_total` | Counter | `from`, `to` | Total cross-transport failover events |
 | `tent_transport_attempts_total` | Counter | `transport`, `operation` | Physical transport attempts submitted for execution |
 | `tent_transport_attempt_failures_total` | Counter | `transport`, `operation` | Physical transport attempts that terminated with `FAILED` |
+| `tent_task_failures_total` | Counter | `transport`, `reason` | Task-level failures by terminal transport and failure reason |
 | `tent_deadline_infeasible_total` | Counter | `transport` | Transfers whose deadline was already in the past at submit time |
 | `tent_read_latency_us` | Histogram | `transport` | Read latency distribution in microseconds |
 | `tent_write_latency_us` | Histogram | `transport` | Write latency distribution in microseconds |
@@ -239,6 +262,8 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_stage_dispatch_us` | Histogram | `transport` | Causal chain: dispatch latency in microseconds |
 | `tent_stage_transport_us` | Histogram | `transport` | Causal chain: transport execution latency in microseconds |
 | `tent_transport_attempt_latency_us` | Histogram | `transport`, `operation` | Observed latency of each physical transport attempt |
+| `tent_inflight_attempts` | Gauge | `transport` | In-flight transport attempts (submitted, not yet finished) |
+| `tent_registered_buffer_bytes` | Gauge | `transport` | Registered local buffer bytes |
 
 **Notes**:
 - `*_requests_total` counts terminal logical/merged-transfer outcomes. Its `transport` label is the **final transport**: a request recovered by RDMA→TCP failover is counted once under `tcp`.
@@ -246,6 +271,9 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 - Attempt latency currently ends when polling or the progress worker observes the terminal status, so it may include completion-observation delay.
 - `*_failures_total` does not record bytes; failed transfers transfer no bytes.
 - `tent_deadline_infeasible_total` is a dedicated counter (not a histogram sentinel) so infeasible-at-submit cases are distinguishable from genuine high-MLU samples.
+- `tent_task_failures_total` attributes the **root cause**: `TaskInfo::failure_stage` marks where the first failure originated (submit rejection vs poll observation, first-set-wins), so a submit failure followed by a successful failover and a later poll failure still counts as `reason="submit"`. Its `transport` label uses the transport captured at attempt start (`attempt_type`), so failures are attributed correctly even when `task.type` has been reset. Unlike the legacy `*_failures_total` counters, it also records `TIMEOUT` and `CANCELED` outcomes.
+- Gauges track engine state, not samples: they keep updating across `setEnabled()` transitions (see Runtime Disable above). `tent_inflight_attempts` persistently high or stuck is the signature of a stalled pipeline.
+- Label cells are created lazily on first record: a metric (including gauge series) only appears in the scrape output after its first event — no failures means no `tent_task_failures_total` series at all. `absent()`-style Prometheus alerts do not apply; alert on values (`> 0`) instead, and use endpoint liveness (connection refused vs 200-with-empty-body) to distinguish a dead endpoint from an idle engine.
 - yalantinglibs omits zero-valued counters/histograms from the Prometheus output, so a metric only appears once it has been observed at least once.
 
 ### Labels
@@ -253,13 +281,15 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 Transfer and attempt metrics carry a `transport` label (the
 `tent_transport_failover_total` counter uses `from` and `to` instead) so they
 can be sliced by transport without grepping logs. Attempt metrics also carry
-an `operation` label. Label values come exclusively from the `TransportType`
-enum closed set — no arbitrary transport strings are accepted.
+an `operation` label; task failure metrics carry a `reason` label. Label
+values come exclusively from the `TransportType` enum closed set — no
+arbitrary transport strings are accepted.
 
 | Label | Values | Description |
 |-------|--------|-------------|
 | `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu` | The transport that handled the transfer |
 | `operation` | `read`, `write` | Attempt operation |
+| `reason` | `submit`, `poll`, `timeout`, `canceled` | Where the task failure originated (root cause) |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |
 
@@ -268,22 +298,27 @@ Transport label values come from the shared `transportTypeName()` mapping.
 
 **Cardinality**: the `transport` label has 11 values; the failover
 `from`/`to` pair has at most 11x11 = 121 combinations (in practice only a
-few pairs ever occur), and each attempt metric has at most 11x2 = 22
-transport/operation combinations. Total series across all metrics is bounded
+few pairs ever occur), each attempt metric has at most 11x2 = 22
+transport/operation combinations, and task failures have at most 11x4 = 44
+transport/reason combinations. Total series across all metrics is bounded
 at ~1500.
 
 ## Integration with TransferEngine
 
-The metrics system is automatically integrated with TransferEngine. When TransferEngine starts, it initializes the metrics system:
+The metrics system is automatically integrated with TransferEngine. When TransferEngine starts, it loads the metrics config from its own configuration chain, validates it, and initializes the metrics system (see `TransferEngineImpl::setup`):
 
 ```cpp
 #include "tent/metrics/tent_metrics.h"
 #include "tent/metrics/config_loader.h"
 
-// Load configuration
-auto metrics_config = MetricsConfigLoader::loadWithDefaults();
+// Passing the engine's Config lets metrics keys come from the same
+// transfer-engine.json / environment chain as the rest of the engine.
+auto metrics_config = MetricsConfigLoader::loadWithDefaults(conf.get());
 if (metrics_config.enabled) {
-    TentMetrics::instance().initialize(metrics_config);
+    std::string error;
+    if (MetricsConfigLoader::validateConfig(metrics_config, &error)) {
+        TentMetrics::instance().initialize(metrics_config);
+    }
 }
 ```
 
@@ -292,6 +327,8 @@ Metrics are automatically recorded at the TENT layer:
 - **Latency tracking**: Start time is recorded when `submitTransfer` is called
 - **Metrics recording**: When `getTransferStatus` detects task completion, latency is calculated and metrics are recorded
 - **Attempt tracking**: Each concrete `Transport::submitTransferTasks()` call is counted as one attempt. A failed attempt is closed before failover changes the task's current transport, and the replacement attempt gets a fresh attempt timestamp. Synchronous submit failures are also closed as failed attempts. The transport is captured when the attempt starts, so it is attributed correctly even if failover overwrites the task's current transport afterwards. Staging is an orchestration step, not a transport attempt: `ProxyManager` chunks the transfer and issues the real transport submissions, which are the ones counted, so a staged transfer is not double-counted.
+- **Failure attribution**: `TaskInfo::failure_stage` marks where a task's first failure originated — at the submit-rejection sites (before any failover recovery attempt) or at poll observation, first-set-wins — and `tent_task_failures_total` records the terminal outcome with that root cause.
+- **State gauges**: In-flight attempts are incremented on attempt submit and decremented on attempt finish; registered buffer bytes are maintained on register/unregisterLocalMemory from the transports that actually registered each buffer.
 
 This provides two complementary views:
 
@@ -312,21 +349,34 @@ multi-attempt request.
 
 ## Adding New Metrics
 
-To add new metrics to the TENT metrics system, follow these steps:
+Hot-path metrics are backed by cached label cells (`tent/include/tent/metrics/cached_metric.h`): the label domain must be a compile-time-known enum (like `TransportType`), each label value maps to a stable slot index, and the steady-state update is a relaxed atomic add on the pre-resolved cell — no lock, no hashing, no string construction.
 
 ### Step 1: Declare the Metric
 
 Add the metric member variable in `tent_metrics.h`:
 
 ```cpp
-// In TentMetrics class private section:
+// CachedDynamicCounter<N>: N = label arity.
+// label_domain_size bounds the slot index space (number of distinct label
+// values that will ever be recorded).
+metrics::CachedDynamicCounter<1> new_counter_{
+    "tent_new_counter_total", "Description of the counter",
+    kTransportLabel, kTransportDomain};
 
-// For a new counter:
-ylt::metric::counter_t new_counter_{"tent_new_counter", "Description of the counter"};
+// CachedDynamicHistogram<N>: composed of cached-cell bucket counters plus
+// the sum counter; bucket boundaries are inclusive upper bounds with a
+// trailing +Inf bucket.
+metrics::CachedDynamicHistogram<1> new_histogram_{
+    "tent_new_histogram_us", "Description", kMyBuckets,
+    kTransportLabel, kTransportDomain};
+```
 
-// For a new histogram:
-ylt::metric::histogram_t new_histogram_{"tent_new_histogram", "Description",
-                                        std::vector<double>{/* bucket boundaries */}};
+Also add a static slot helper so callers map an enum to a stable index:
+
+```cpp
+static size_t newCounterSlot(TransportType tp) {
+    return static_cast<size_t>(tp);
+}
 ```
 
 ### Step 2: Register the Metric
@@ -338,33 +388,47 @@ void TentMetrics::registerMetrics() {
     counters_ = {
         &read_bytes_total_,
         // ... existing counters ...
-        &new_counter_,  // Add new counter here
+        &new_counter_,  // counters serialize via the standard path
     };
 
     histograms_ = {
-        {&read_latency_, &kLatencyBuckets},
+        &read_latency_,
         // ... existing histograms ...
-        {&new_histogram_, &kNewBuckets},  // Add new histogram + its buckets here
+        &new_histogram_,
+    };
+
+    // Gauges (cached cells used with paired add/sub) serialize through
+    // serializeGaugePrometheus() instead — do NOT add them to counters_.
+    gauges_ = {
+        &inflight_attempts_,
+        // ...
     };
 }
 ```
 
-### Step 3: Add Recording Methods (Optional)
+### Step 3: Add Recording Methods
 
-If needed, add public methods to record the metric:
+Add public methods that resolve the cell lazily and update it:
 
 ```cpp
 // In tent_metrics.h:
-void recordNewMetric(int64_t value);
+void recordNewMetric(TransportType tp, int64_t value);
 
 // In tent_metrics.cpp:
-void TentMetrics::recordNewMetric(int64_t value) {
-    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed)) return;
-    new_counter_.inc(value);
-    // or for histogram:
-    // new_histogram_.observe(value);
+void TentMetrics::recordNewMetric(TransportType tp, int64_t value) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    new_counter_.incCached(newCounterSlot(tp), [tp] {
+        return std::array<std::string, 1>{transportTypeName(tp)};
+    }, value);
 }
 ```
+
+The label lambda only runs on the first use of a slot (cache miss); the
+steady state is a relaxed `fetch_add`. For histograms use `observeCached()`.
+For state gauges, use paired `incCached(..., +1)` / `incCached(..., -1)`
+calls that ignore `runtime_enabled_` (see Runtime Disable above), and add
+matching stubs to the `#else` (compile-time disabled) section.
 
 ### Automatic Serialization
 
@@ -452,6 +516,17 @@ rate(tent_transport_failover_total{from="rdma",to="tcp"}[5m])
 sum(rate(tent_transport_attempt_failures_total{transport="rdma"}[5m]))
 /
 sum(rate(tent_transport_attempts_total{transport="rdma"}[5m]))
+
+# Task failure rate by reason (root cause: submit rejection vs in-flight failure)
+sum by (reason) (rate(tent_task_failures_total[5m]))
+
+# In-flight attempts — a persistently high or stuck value signals a stalled
+# pipeline
+tent_inflight_attempts
+
+# Alert: any task failure at all (values, not series presence — see lazy
+# registration note above)
+sum(rate(tent_task_failures_total[5m])) > 0
 
 # P99 latency of RDMA write attempts
 histogram_quantile(
