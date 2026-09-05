@@ -32,6 +32,7 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <sstream>
@@ -364,7 +365,26 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     params->verbose = conf->get("verbose", false);
     params->log_slice_affinity =
         conf->get("transports/rdma/log_slice_affinity", false);
+    params->with_nvidia_peermem =
+        conf->get("transports/rdma/with_nvidia_peermem", false);
     return Status::OK();
+}
+
+static bool isPeermemModuleLoaded() {
+    // NVIDIA: nvidia_peermem. AMD: peermem is built into amdgpu (linked with
+    // ib_core), so the amdgpu module itself is the presence signal.
+    // Hygon: the hycu driver provides the same peer-memory support.
+    std::ifstream modules("/proc/modules");
+    std::string line;
+    while (std::getline(modules, line)) {
+        const auto name_end = line.find(' ');
+        const auto name =
+            name_end == std::string::npos ? line : line.substr(0, name_end);
+        if (name == "nvidia_peermem" || name == "amdgpu" || name == "hycu") {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
@@ -381,21 +401,17 @@ static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
         auto& loader = IbvLoader::Instance();
         return loader.available() && loader.sym().ibv_reg_dmabuf_mr != nullptr;
     }
-    // Detect vendor GPUDirect/peer-memory drivers from /proc/modules.
-    // NVIDIA: nvidia_peermem. AMD: peermem is built into amdgpu (linked with
-    // ib_core), so the amdgpu module itself is the presence signal.
-    // Hygon: the hycu driver provides the same peer-memory support.
-    std::ifstream modules("/proc/modules");
-    std::string line;
-    while (std::getline(modules, line)) {
-        const auto name_end = line.find(' ');
-        const auto name =
-            name_end == std::string::npos ? line : line.substr(0, name_end);
-        if (name == "nvidia_peermem" || name == "amdgpu" || name == "hycu") {
-            return true;
-        }
+    const bool with_nvidia_peermem =
+        conf->get("transports/rdma/with_nvidia_peermem", false);
+    if (with_nvidia_peermem) {
+        return isPeermemModuleLoaded();
     }
-    return false;
+    // Default: DMA-BUF first. Some GPUs/drivers advertise no DMA-BUF (H20
+    // here: CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED=0, export returns 801) and
+    // still do GDR through nvidia-peermem. Keep gpu_to_gpu on in that case so
+    // registration can fall back to ibv_reg_mr instead of host-bounce.
+    return RdmaContext::dmaBufRegistrationAvailable() ||
+           isPeermemModuleLoaded();
 }
 
 RdmaTransport::RdmaTransport()
@@ -513,6 +529,15 @@ Status RdmaTransport::install(std::string& local_segment_name,
         caps.dram_to_gpu = true;
         caps.gpu_to_dram = true;
         caps.gpu_to_gpu = true;
+        if (params_->with_nvidia_peermem) {
+            LOG(INFO) << "RdmaTransport(TENT): GPUDirect RDMA via "
+                         "nvidia-peermem/amdgpu (WITH_NVIDIA_PEERMEM)";
+        } else if (RdmaContext::dmaBufRegistrationAvailable()) {
+            LOG(INFO) << "RdmaTransport(TENT): GPUDirect RDMA via DMA-BUF";
+        } else {
+            LOG(INFO) << "RdmaTransport(TENT): GPUDirect RDMA via "
+                         "nvidia-peermem (DMA-BUF not available on this GPU)";
+        }
     }
     return Status::OK();
 }

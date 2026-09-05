@@ -187,6 +187,7 @@ Status XpuPlatform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
     // range running past the allocation would describe memory it does not
     // cover.
     CHECK_STATUS(xpu_detail::validateDmabufRange(offset, length, alloc_size));
+    out.method = DmabufExport::Method::kDmabufReg;
     out.fd = fd;
     out.offset = offset;
     return Status::OK();

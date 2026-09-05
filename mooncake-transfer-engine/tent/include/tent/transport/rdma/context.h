@@ -114,6 +114,35 @@ class RdmaContext {
         dmabuf_exporter_ = std::move(exporter);
     }
 
+    // Shared-fd CUDA variant: the caller exports a single dma_buf fd for the
+    // buffer via exportDmabuf(), passes the same handle to every NIC's
+    // registration, then closes the fd once via closeDmabufExport() AFTER all
+    // registrations have completed. This keeps one dma_buf object alive across
+    // all NICs so the GPU driver reserves a single BAR1 window for the buffer.
+    // XPU/host paths pass kHostReg and fall through to Platform::exportDmabuf
+    // or ibv_reg_mr. Do not close XPU fds: the exporting runtime owns them.
+    MemReg registerMemReg(void *addr, size_t length, int access,
+                          const DmabufExport &exp);
+
+    // Exports a CUDA dma_buf fd for the allocation backing addr. GPU device
+    // memory yields kDmabufReg with a live fd unless with_nvidia_peermem is
+    // set; host memory and the nvidia-peermem path yield kHostReg with no fd.
+    // Any CUDA fd placed in out.fd MUST be closed by the caller (via
+    // closeDmabufExport) AFTER every registerMemReg() call consuming it has
+    // returned — each successful registration takes its own reference, so
+    // closing earlier would invalidate the fd for the remaining NICs.
+    static int exportDmabuf(void *addr, DmabufExport &out,
+                            bool with_nvidia_peermem);
+
+    // Closes a CUDA-exported dma_buf fd, if any. Idempotent. Must not be used
+    // on fds owned by Platform::exportDmabuf (XPU Level Zero caches them).
+    static void closeDmabufExport(DmabufExport &exp);
+
+    // True when libibverbs has ibv_reg_dmabuf_mr and at least one CUDA
+    // device reports CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED. Used to enable
+    // gpu_to_gpu without nvidia-peermem.
+    static bool dmaBufRegistrationAvailable();
+
     // Warm up RDMA MR registration by temporarily registering/deregistering.
     // This targets RDMA driver-side pinning/metadata and differs from CPU
     // prefault (madvise/mlock/touch) used before NUMA probing.

@@ -51,6 +51,11 @@ inline bool isGpuMemoryType(MemoryType t) {
 // buffer, which covers the whole underlying allocation, not just the
 // requested range.
 struct DmabufExport {
+    // CUDA shared-fd registration uses this to tell ibv_reg_dmabuf_mr from
+    // ibv_reg_mr. XPU Platform::exportDmabuf leaves the default and never
+    // closes `fd` (the exporting runtime owns it).
+    enum class Method { kHostReg, kDmabufReg };
+    Method method = Method::kHostReg;
     int fd = -1;
     uint64_t offset = 0;
 };
