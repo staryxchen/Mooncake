@@ -20,17 +20,12 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
-#ifdef USE_CUDA
-#include <cuda_runtime.h>
-#endif
-
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
 #include <cstdlib>
 #include <future>
 #include <limits>
-#include <set>
 #include <sstream>
 
 #include "tent/common/status.h"
@@ -39,6 +34,7 @@
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/workers.h"
 #include "tent/common/utils/string_builder.h"
+#include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 #include "tent/common/utils/random.h"
 #include "tent/thirdparty/nlohmann/json.h"
@@ -85,75 +81,6 @@ uint16_t getRdmaBindDefaultPort(const Config& config) {
     }
 
     return 0;
-}
-
-// Dest-GPU visibility for GPUDirect writes is not implied by a successful
-// local CQ. Synchronize only CUDA devices named in this engine's topology so
-// teardown does not create primary contexts on unused GPUs.
-Status synchronizeDestCudaDevices(const Topology* topology) {
-#ifdef USE_CUDA
-    if (!topology) return Status::OK();
-
-    const size_t mem_count = topology->getMemCount();
-    bool any_cuda = false;
-    for (size_t i = 0; i < mem_count; ++i) {
-        const auto* mem =
-            topology->getMemEntry(static_cast<Topology::MemID>(i));
-        if (mem && mem->type == Topology::MEM_CUDA) {
-            any_cuda = true;
-            break;
-        }
-    }
-    if (!any_cuda) return Status::OK();
-
-    int device_count = 0;
-    cudaError_t err = cudaGetDeviceCount(&device_count);
-    if (err != cudaSuccess || device_count <= 0) {
-        if (err != cudaSuccess) {
-            LOG(WARNING) << "RDMA quiesce cudaGetDeviceCount failed: "
-                         << cudaGetErrorString(err);
-            (void)cudaGetLastError();
-        }
-        return Status::OK();
-    }
-
-    int saved = 0;
-    const bool have_saved = cudaGetDevice(&saved) == cudaSuccess;
-    if (!have_saved) (void)cudaGetLastError();
-
-    for (size_t i = 0; i < mem_count; ++i) {
-        const auto* mem =
-            topology->getMemEntry(static_cast<Topology::MemID>(i));
-        if (!mem || mem->type != Topology::MEM_CUDA) continue;
-        LocationParser parser(mem->name);
-        const int device = parser.index();
-        if (device < 0 || device >= device_count) continue;
-        err = cudaSetDevice(device);
-        if (err != cudaSuccess) {
-            LOG(WARNING) << "RDMA quiesce cudaSetDevice(" << device
-                         << ") failed: " << cudaGetErrorString(err);
-            (void)cudaGetLastError();
-            continue;
-        }
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            LOG(WARNING) << "RDMA quiesce cudaDeviceSynchronize device "
-                         << device << " failed: " << cudaGetErrorString(err);
-            (void)cudaGetLastError();
-        }
-    }
-    if (have_saved) {
-        err = cudaSetDevice(saved);
-        if (err != cudaSuccess) {
-            LOG(WARNING) << "RDMA quiesce restore cudaSetDevice(" << saved
-                         << ") failed: " << cudaGetErrorString(err);
-            (void)cudaGetLastError();
-        }
-    }
-#else
-    (void)topology;
-#endif
-    return Status::OK();
 }
 
 }  // namespace
@@ -464,7 +391,8 @@ Status RdmaTransport::quiesce() {
             LOG(ERROR) << "RDMA workers quiesce failed: " << drain.ToString();
         }
     }
-    const Status sync = synchronizeDestCudaDevices(local_topology_.get());
+    const Status sync =
+        Platform::getLoader().synchronizeDevices(local_topology_.get());
     if (!sync.ok()) {
         LOG(WARNING) << "RDMA dest-GPU sync during quiesce failed: "
                      << sync.ToString();

@@ -31,6 +31,7 @@
 #include "tent/common/config.h"
 #include "tent/common/types.h"
 #include "tent/transfer_engine.h"
+#include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 #include "tent/transport/rdma/context.h"
 #include "tent/transport/rdma/params.h"
@@ -941,6 +942,20 @@ TEST(RdmaQuiesceTest, TransportQuiesceWithoutInstallIsOk) {
     RdmaTransport transport;
     EXPECT_TRUE(transport.quiesce().ok());
     EXPECT_TRUE(transport.quiesce().ok());
+}
+
+TEST(RdmaQuiesceTest, TransportQuiesceSyncsTopologyDevicesViaPlatform) {
+    auto topology = std::make_shared<Topology>();
+    Topology::MemEntry memory;
+    memory.name = "cuda:0";
+    memory.type = Topology::MEM_CUDA;
+    memory.numa_node = 0;
+    topology->mem_list_.push_back(std::move(memory));
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    EXPECT_TRUE(transport.quiesce().ok());
+    EXPECT_TRUE(Platform::getLoader().synchronizeDevices(topology.get()).ok());
 }
 
 TEST(RdmaQuiesceTest, WorkersQuiesceWithoutStartRejectsSubmit) {
