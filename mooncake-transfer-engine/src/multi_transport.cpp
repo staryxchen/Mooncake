@@ -148,11 +148,29 @@ Status MultiTransport::submitTransfer(
 
     std::vector<Transport*> transports;
     transports.reserve(entries.size());
+#ifdef ENABLE_MULTI_PROTOCOL
+    // A multi-protocol segment ("rdma,hip") routes by target_offset too, so
+    // the transport is not a function of target_id. Deciding that per request
+    // would cost another segment lookup, which is what reuse is meant to save.
+    constexpr bool kTransportFollowsTargetId = false;
+#else
+    constexpr bool kTransportFollowsTargetId = true;
+#endif
+    // Skip the metadata lookup on consecutive requests sharing a target_id.
+    Transport* last_transport = nullptr;
+    Transport::SegmentID last_target_id = static_cast<Transport::SegmentID>(-1);
     for (const auto& request : entries) {
         Transport* transport = nullptr;
-        auto status = selectTransport(request, transport);
-        if (!status.ok()) return status;
-        assert(transport);
+        if (kTransportFollowsTargetId && last_transport &&
+            request.target_id == last_target_id) {
+            transport = last_transport;
+        } else {
+            auto status = selectTransport(request, transport);
+            if (!status.ok()) return status;
+            assert(transport);
+            last_transport = transport;
+            last_target_id = request.target_id;
+        }
         transports.push_back(transport);
     }
 
