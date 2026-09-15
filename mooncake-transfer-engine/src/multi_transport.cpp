@@ -383,6 +383,28 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
         return Status::OK();
     }
 
+    // CQ workers publish finished_task_count via Slice::markSuccess. Once the
+    // counter is moving, do not walk the task list; that is the NIXL
+    // large-batch poll cost. Transports that never call markSuccess keep
+    // finished_task_count at 0 and still fall through to the per-task walk.
+    const uint64_t finished =
+        batch_desc.finished_task_count.load(std::memory_order_acquire);
+    if (finished > 0 && finished < task_count) {
+        status.s = Transport::TransferStatusEnum::WAITING;
+        return Status::OK();
+    }
+    if (finished >= task_count && task_count > 0) {
+        if (batch_desc.has_failure.load(std::memory_order_acquire)) {
+            status.s = Transport::TransferStatusEnum::FAILED;
+        } else {
+            status.s = Transport::TransferStatusEnum::COMPLETED;
+            status.transferred_bytes = batch_desc.finished_transfer_bytes.load(
+                std::memory_order_relaxed);
+            batch_desc.is_finished.store(true, std::memory_order_release);
+        }
+        return Status::OK();
+    }
+
     size_t success_count = 0;
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         TransferStatus task_status;
