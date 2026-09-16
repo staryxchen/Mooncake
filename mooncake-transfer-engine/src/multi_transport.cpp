@@ -148,11 +148,21 @@ Status MultiTransport::submitTransfer(
 
     std::vector<Transport*> transports;
     transports.reserve(entries.size());
+    Transport* reused_transport = nullptr;
+    Transport::SegmentID reused_target =
+        static_cast<Transport::SegmentID>(-1);
+    bool reused_allows = false;
     for (const auto& request : entries) {
         Transport* transport = nullptr;
-        auto status = selectTransport(request, transport);
-        if (!status.ok()) return status;
-        assert(transport);
+        if (reused_allows && request.target_id == reused_target) {
+            transport = reused_transport;
+        } else {
+            auto status = selectTransport(request, transport, &reused_allows);
+            if (!status.ok()) return status;
+            assert(transport);
+            reused_transport = transport;
+            reused_target = request.target_id;
+        }
         transports.push_back(transport);
     }
 
@@ -630,11 +640,19 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 }
 
 Status MultiTransport::selectTransport(const TransferRequest& entry,
-                                       Transport*& transport) {
+                                       Transport*& transport,
+                                       bool* allows_reuse) {
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
+        if (allows_reuse) *allows_reuse = false;
         return Status::InvalidArgument("Invalid target segment ID " +
                                        std::to_string(entry.target_id));
+    }
+    // Offset-based routing is only needed when one segment advertises more
+    // than one protocol. A homogeneous rdma batch can reuse this Transport*.
+    if (allows_reuse) {
+        *allows_reuse =
+            target_segment_desc->protocol.find(',') == std::string::npos;
     }
 
     auto proto = target_segment_desc->protocol;

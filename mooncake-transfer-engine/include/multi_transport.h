@@ -98,7 +98,8 @@ class MultiTransport {
                           const std::vector<TransferRequest> &entries,
                           std::vector<size_t> *task_sizes);
 
-    Status selectTransport(const TransferRequest &entry, Transport *&transport);
+    Status selectTransport(const TransferRequest &entry, Transport *&transport,
+                           bool *allows_reuse = nullptr);
 
 #ifdef ENABLE_MULTI_PROTOCOL
     Status mp_selectTransport(const TransferRequest &entry,
