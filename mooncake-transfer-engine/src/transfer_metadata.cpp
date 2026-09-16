@@ -1369,10 +1369,31 @@ TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
     return result;
 }
 
+void TransferMetadata::SegmentDesc::rebuildInternedNicPaths() const {
+    interned_nic_paths_.clear();
+    interned_nic_paths_.reserve(devices.size());
+    const auto &server = nicPathServerName();
+    for (const auto &device : devices) {
+        interned_nic_paths_.push_back(MakeNicPath(server, device.name));
+    }
+}
+
+const std::string &TransferMetadata::SegmentDesc::internedNicPath(
+    size_t device_id) const {
+    if (interned_nic_paths_.size() != devices.size()) {
+        rebuildInternedNicPaths();
+    }
+    if (device_id >= interned_nic_paths_.size()) {
+        static const std::string kEmpty;
+        return kEmpty;
+    }
+    return interned_nic_paths_[device_id];
+}
+
 bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
-    // timestamp, metadata_version, and buffer_range_index are excluded:
-    // publication may refresh timestamps, and the index is derived from
-    // `buffers`.
+    // timestamp, metadata_version, buffer_range_index, and interned_nic_paths_
+    // are excluded: publication may refresh timestamps, and the last two are
+    // derived from `buffers` / `devices`.
     return name == other.name && protocol == other.protocol &&
            devices == other.devices && topology == other.topology &&
            buffers == other.buffers && nvmeof_buffers == other.nvmeof_buffers &&

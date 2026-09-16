@@ -277,6 +277,15 @@ TEST(BufferRangeIndex, DeviceHintDoesNotFollowBufferJump) {
     EXPECT_EQ(jumped_buffer, 1);
 }
 
+TEST(BufferRangeIndex, InternedNicPathIsStable) {
+    auto desc = MakeSegment({MakeBuffer(0x1000, 0x1000, 0)});
+    desc.devices.push_back({"mlx5_unit_test", 1, "", ""});
+    const auto &first = desc.internedNicPath(0);
+    const auto &second = desc.internedNicPath(0);
+    EXPECT_EQ(&first, &second);
+    EXPECT_EQ(first, MakeNicPath(desc.nicPathServerName(), "mlx5_unit_test"));
+}
+
 TEST(BufferRangeIndex, SelectDeviceMatchesLinearFirstMatch) {
     std::mt19937 rng(2262008);
     std::uniform_int_distribution<int> region_dist(1, 64);

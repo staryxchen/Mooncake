@@ -131,6 +131,12 @@ class TransferMetadata {
         // push_back/erase must call rebuildBufferRangeIndex() again.
         BufferRangeIndex buffer_range_index;
         void rebuildBufferRangeIndex() { buffer_range_index.rebuild(buffers); }
+        // Derived from `name`/`rdma_server_name` + `devices`. Filled lazily
+        // on first internedNicPath() so the RDMA mapping path can point slices
+        // at a stable string instead of concatenating server@nic per slice.
+        mutable std::vector<std::string> interned_nic_paths_;
+        void rebuildInternedNicPaths() const;
+        const std::string &internedNicPath(size_t device_id) const;
         // this is for nvmeof.
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
         // this is for cxl.
