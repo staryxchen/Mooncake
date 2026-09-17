@@ -260,7 +260,7 @@ void WorkerPool::enqueueSlicesToOwner(int owner_thread,
     const std::string *last_path = nullptr;
     SliceList *dst = nullptr;
     for (auto *slice : slices) {
-        const std::string &path = slice->peer_nic_path;
+        const std::string &path = slice->peerNicPath();
         if (dst == nullptr || *last_path != path) {
             last_path = &path;
             dst = &queues[path];
@@ -454,10 +454,10 @@ void WorkerPool::enqueuePreparedSlices(const SliceList &slice_list,
                                        uint64_t submitted_slice_count) {
     std::vector<SliceList> by_owner(static_cast<size_t>(worker_count_));
     for (auto *slice : slice_list) {
-        const int owner_thread = postingThreadForPeer(slice->peer_nic_path);
+        const int owner_thread = postingThreadForPeer(slice->peerNicPath());
         if (owner_thread < 0 || owner_thread >= worker_count_) {
             LOG(ERROR) << "Invalid RDMA worker owner " << owner_thread
-                       << " for peer " << slice->peer_nic_path;
+                       << " for peer " << slice->peerNicPath();
             slice->markFailed();
             processed_slice_count_.fetch_add(1);
             continue;
