@@ -148,13 +148,16 @@ Status MultiTransport::submitTransfer(
 
     std::vector<Transport*> transports;
     transports.reserve(entries.size());
+    // Reuse only address-independent routes within this submission. Mixed
+    // protocol segments must still resolve each address independently, and
+    // disabling the metadata cache must retain the explicit refresh behavior.
     Transport* reused_transport = nullptr;
-    Transport::SegmentID reused_target =
-        static_cast<Transport::SegmentID>(-1);
+    Transport::SegmentID reused_target = static_cast<Transport::SegmentID>(-1);
     bool reused_allows = false;
     for (const auto& request : entries) {
         Transport* transport = nullptr;
-        if (reused_allows && request.target_id == reused_target) {
+        if (reused_allows && globalConfig().metacache &&
+            request.target_id == reused_target) {
             transport = reused_transport;
         } else {
             auto status = selectTransport(request, transport, &reused_allows);

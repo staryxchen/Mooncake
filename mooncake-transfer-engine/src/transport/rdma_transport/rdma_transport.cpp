@@ -14,6 +14,8 @@
 
 #include "transport/rdma_transport/rdma_transport.h"
 
+#include "transport/rdma_transport/rdma_batch_cache.h"
+
 #include <glog/logging.h>
 #include <sys/mman.h>
 #include <sys/time.h>
@@ -880,6 +882,7 @@ Status RdmaTransport::submitTransferTask(
     };
     uint64_t nr_slices;
     size_t task_index = 0, request_index = 0;
+    BatchRdmaDeviceCache local_device_cache;
     int last_local_buffer_id = -1;
     int last_local_device_id = -1;
     int last_local_device_buffer_id = -1;
@@ -915,9 +918,14 @@ Status RdmaTransport::submitTransferTask(
             last_local_device_buffer_id == last_local_buffer_id
                 ? last_local_device_id
                 : -1;
-        if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
-                         request.length, request_buffer_id, request_device_id,
-                         0, last_local_buffer_id, local_hint_device_id)) {
+        if (local_device_cache.select(
+                local_segment_desc, (uint64_t)request.source, request.length,
+                request_buffer_id, request_device_id, [&] {
+                    return selectDevice(
+                        local_segment_desc.get(), (uint64_t)request.source,
+                        request.length, request_buffer_id, request_device_id, 0,
+                        last_local_buffer_id, local_hint_device_id);
+                })) {
             request_buffer_id = -1;
             request_device_id = -1;
         } else {

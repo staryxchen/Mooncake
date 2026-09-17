@@ -14,6 +14,8 @@
 
 #include "transport/rdma_transport/worker_pool.h"
 
+#include "transport/rdma_transport/rdma_batch_cache.h"
+
 #include <sys/epoll.h>
 
 #include <algorithm>
@@ -191,10 +193,9 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
         auto hint = config.enable_dest_device_affinity
                         ? std::string_view(local_hca)
                         : std::string_view();
-        ret = RdmaTransport::selectDevice(peer_segment_desc, offset, length,
-                                          hint, buffer_id, device_id,
-                                          retry_count, hint_buffer_id,
-                                          hint_device_id);
+        ret = RdmaTransport::selectDevice(
+            peer_segment_desc, offset, length, hint, buffer_id, device_id,
+            retry_count, hint_buffer_id, hint_device_id);
     }
     if (ret) return ret;
 
@@ -334,6 +335,7 @@ int WorkerPool::submitPostSend(
     SliceList prepared_slice_list;
     uint64_t submitted_slice_count = 0;
     thread_local std::unordered_map<int, uint64_t> failed_target_ids;
+    BatchRdmaDeviceCache peer_device_cache;
     int last_buffer_id = -1;
     int last_device_id = -1;
     SegmentID last_target_id = static_cast<SegmentID>(-1);
@@ -354,9 +356,14 @@ int WorkerPool::submitPostSend(
             last_device_id = -1;
             last_target_id = slice->target_id;
         }
-        if (selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
-                             slice->length, context_.deviceName(), buffer_id,
-                             device_id, 0, last_buffer_id, last_device_id)) {
+        if (peer_device_cache.select(
+                peer_segment_desc, slice->rdma.dest_addr, slice->length,
+                buffer_id, device_id, [&] {
+                    return selectPeerDevice(
+                        peer_segment_desc.get(), slice->rdma.dest_addr,
+                        slice->length, context_.deviceName(), buffer_id,
+                        device_id, 0, last_buffer_id, last_device_id);
+                })) {
             peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
                 slice->target_id, true);
             if (!peer_segment_desc) {
@@ -816,8 +823,8 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
         } else {
             drained.push_back(signaled);
             if (signaled->rdma.qp_depth)
-                signaled->rdma.qp_depth->fetch_sub(
-                    1, std::memory_order_acq_rel);
+                signaled->rdma.qp_depth->fetch_sub(1,
+                                                   std::memory_order_acq_rel);
         }
         cqe_consumed++;
         if (globalConfig().track_rdma_posted_slices) {
