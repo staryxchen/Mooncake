@@ -87,7 +87,9 @@ class MultiTransport {
         BatchID batch_id, size_t task_id,
         std::vector<TransferStatusEnum> &request_statuses);
 
-    Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
+    // walk_tasks skips the finished-task counter shortcut and asks every task.
+    Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status,
+                                  bool walk_tasks = false);
 
     // See TransferEngine::completionFd() / RFC #5164.
     int completionFd() const { return completion_fd_; }
