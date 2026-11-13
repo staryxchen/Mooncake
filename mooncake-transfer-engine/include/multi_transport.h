@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "transport/transport.h"
+#include "task_congestion_status.h"
 
 namespace mooncake {
 
@@ -82,6 +83,12 @@ class MultiTransport {
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status);
+
+    Status getTaskCongestionState(BatchID batch_id, size_t task_id,
+                                  TaskCongestionState &state) const;
+
+    Status getTaskCongestionDetail(BatchID batch_id, size_t task_id,
+                                   TaskCongestionDetail &detail) const;
 
     Status getScatterRequestStatuses(
         BatchID batch_id, size_t task_id,

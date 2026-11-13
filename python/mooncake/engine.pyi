@@ -19,6 +19,8 @@ SUPPORT_INTRA_NVLINK: bool
 SUPPORT_MNNVL: bool
 SUPPORT_MULTI_PROTOCOL: bool
 SUPPORT_MUSA: bool
+SUPPORT_TENT: bool
+SUPPORT_XPU: bool
 
 class CompletionNotificationFallback(Exception):
     """Notification was requested, but this submit must fall back to polling."""
